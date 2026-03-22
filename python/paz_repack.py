@@ -84,6 +84,93 @@ def _pad_to_orig_size(data: bytes, orig_size: int) -> bytes:
     return data + b'\x00' * (orig_size - len(data))
 
 
+def _shrink_to_orig_size(data: bytes, orig_size: int) -> bytes:
+    """Shrink XML data to exactly orig_size by removing comment content
+    and collapsing redundant whitespace.
+
+    Removes bytes from the end of XML comments first (replacing the
+    comment body with fewer characters). If that's not enough, collapses
+    runs of multiple spaces/tabs into single spaces.
+
+    Returns:
+        data trimmed to exactly orig_size bytes
+
+    Raises:
+        ValueError if the data can't be shrunk enough
+    """
+    if len(data) <= orig_size:
+        return _pad_to_orig_size(data, orig_size)
+
+    excess = len(data) - orig_size
+    result = bytearray(data)
+
+    # Phase 1: trim comment bodies from the end (preserve <!-- -->)
+    comments = _find_xml_comments(bytes(result))
+    # Process largest comments first for maximum yield
+    comments.sort(key=lambda c: c[1] - c[0], reverse=True)
+
+    for cstart, cend in comments:
+        if excess <= 0:
+            break
+        body_len = cend - cstart
+        # Keep at least 1 space in the comment so it stays valid
+        removable = body_len - 1
+        if removable <= 0:
+            continue
+        to_remove = min(removable, excess)
+        # Replace the end of the comment body with nothing
+        result[cstart + 1:cstart + 1 + to_remove] = b''
+        excess -= to_remove
+        if excess <= 0:
+            break
+        # Recalculate comments since offsets shifted
+        comments = _find_xml_comments(bytes(result))
+        comments.sort(key=lambda c: c[1] - c[0], reverse=True)
+
+    if excess <= 0:
+        return bytes(result[:orig_size]) if len(result) >= orig_size else \
+            bytes(result) + b'\x00' * (orig_size - len(result))
+
+    # Phase 2: collapse runs of 2+ whitespace chars into single space
+    i = len(result) - 1
+    while i > 0 and excess > 0:
+        if result[i] in (0x20, 0x09) and result[i - 1] in (0x20, 0x09):
+            # Found consecutive whitespace, remove one
+            del result[i]
+            excess -= 1
+        i -= 1
+
+    if excess <= 0:
+        return bytes(result[:orig_size]) if len(result) >= orig_size else \
+            bytes(result) + b'\x00' * (orig_size - len(result))
+
+    # Phase 3: remove entire empty comments (<!-- ... --> -> nothing)
+    comments = _find_xml_comments(bytes(result))
+    for cstart, cend in comments:
+        if excess <= 0:
+            break
+        # Remove <!-- + body + -->  (4 + body_len + 3 bytes)
+        full_start = cstart - 4
+        full_end = cend + 3
+        removable = full_end - full_start
+        if removable <= excess + 7:  # worth removing the whole comment
+            to_remove = min(removable, excess)
+            # Just remove bytes from the comment
+            result[full_start:full_start + to_remove] = b''
+            excess -= to_remove
+            if excess <= 0:
+                break
+            comments = _find_xml_comments(bytes(result))
+
+    if len(result) > orig_size:
+        raise ValueError(
+            f"Modified file is {len(data) - orig_size} bytes over orig_size "
+            f"({orig_size}). Could only trim {len(data) - len(result)} bytes "
+            f"from comments and whitespace. Reduce content manually.")
+
+    return bytes(result) + b'\x00' * (orig_size - len(result))
+
+
 def _find_xml_comments(data: bytes) -> list[tuple[int, int]]:
     """Find all XML comment bodies (content between <!-- and -->).
 
@@ -110,9 +197,10 @@ def _match_compressed_size(plaintext: bytes, target_comp_size: int,
                            target_orig_size: int) -> bytes:
     """Adjust plaintext so it compresses to exactly target_comp_size.
 
-    Strategy: find individual byte positions where replacing with a space
-    changes the LZ4 compressed output size by the needed amount. Tries
-    XML comment content first, then other non-critical positions.
+    If the plaintext is larger than target_orig_size, trims comment content
+    and whitespace to fit. Then finds individual byte positions where
+    replacing with a space changes the LZ4 compressed output to exactly
+    the target.
 
     Returns:
         adjusted plaintext (exactly target_orig_size bytes)
@@ -120,7 +208,10 @@ def _match_compressed_size(plaintext: bytes, target_comp_size: int,
     Raises:
         ValueError if size matching fails
     """
-    padded = _pad_to_orig_size(plaintext, target_orig_size)
+    if len(plaintext) > target_orig_size:
+        padded = _shrink_to_orig_size(plaintext, target_orig_size)
+    else:
+        padded = _pad_to_orig_size(plaintext, target_orig_size)
 
     comp = lz4.block.compress(padded, store_size=False)
     if len(comp) == target_comp_size:
